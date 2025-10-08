@@ -4,10 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="ee1d77a5-bb5f-4378-b83b-a8b4bf7569e9" name="변경" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/dsa.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/dsa.iml" afterDir="false" />
+    <list default="true" id="ee1d77a5-bb5f-4378-b83b-a8b4bf7569e9" name="변경" comment="1'st commit">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/bot.py" beforeDir="false" afterPath="$PROJECT_DIR$/bot.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -62,6 +61,19 @@
       <option name="presentableId" value="Default" />
       <updated>1759915704840</updated>
     </task>
+    <task id="LOCAL-00001" summary="1'st commit">
+      <option name="closed" value="true" />
+      <created>1759916627055</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1759916627055</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="1'st commit" />
+    <option name="LAST_COMMIT_MESSAGE" value="1'st commit" />
   </component>
 </project>

@@ -140,65 +140,43 @@ class CancelOrderWorker(QRunnable):
 
     @pyqtSlot()
     def run(self):
-        """Issue the cancel request and poll for confirmation with retries."""
-        bot = self.bot
-        order_id = self.order_id
-        data = self.data
+        """Configure recurring timers and start the bot event loop."""
+        self.log("System", f"TradingBot thread ID: {threading.get_ident()}")
 
-        bot.log(
-            "System",
-            f"[{data['symbol']}] Order ({order_id}) exceeds 15 seconds, automatically canceled.",
-        )
+        # --- Strategy Manager Setup ---
+        self.strategy_manager = StrategyManager(self)
+        self.strategy_manager.buy_signal_found.connect(self.handle_buy_check_result)
+        self.strategy_manager.status_update_signal.connect(self.status_update_signal)
 
-        cancel_res = self.api.cancel_order(order_id, data["symbol"], data.get("side"))
-        if not cancel_res:
-            bot.log(
-                "Trade Fail",
-                f"[{data['symbol']}] Failed to call order({order_id}) cancellation API.",
+        if not all(
+                len(lst) == len(config.TRAILING_BOUNDS)
+                for lst in [
+                    config.TRAILING_TS_PCT,
+                    config.TRAILING_MIN_TICKS,
+                    config.TRAILING_LIM_CUSHION,
+                ]
+        ):
+            self.log(
+                "Errors", "Trailing stop configuration lists have inconsistent lengths."
             )
-            with bot.state_lock:
-                if order_id in bot.pending_orders:
-                    bot.pending_orders[order_id].pop("cancellation_attempted", None)
+            self.stop()
             return
 
-        for _ in range(5):
-            time.sleep(0.5)
-            details = self.api.get_order_details(order_id, data["symbol"])
+        self.log("System", "Start the trading bot.")
+        self.load_initial_data()
 
-            if not details:
-                continue
+        if not self.is_running:
+            return
 
-            if details.get("status") == "canceled":
-                bot.log(
-                    "System",
-                    f"[{data['symbol']}] Order ({order_id}) cancellation confirmed.",
-                )
-                with bot.state_lock:
-                    if order_id in bot.pending_orders:
-                        if bot.pending_orders[order_id]["side"] == "buy":
-                            cost = bot.pending_orders[order_id].get(
-                                "cost", Decimal("0")
-                            )
-                            bot.krw_reserved -= cost
-                        del bot.pending_orders[order_id]
-                        bot.db.update_order_status(order_id, "canceled")
-                return
+        self.sell_timer = QTimer()
+        self.sell_timer.timeout.connect(self.perform_sell_cycle)
+        self.sell_timer.start(SELL_CYCLE_INTERVAL_SECONDS * 1000)
+        self.strategy_manager.start_scan_timer()
+        self.exec()
 
-            if details.get("status") == "closed":
-                bot.log(
-                    "System",
-                    f"[{data['symbol']}] Confirmation of order cancellation attempt ({order_id}).",
-                )
-                return
-
-        bot.log(
-            "System",
-            f"[{data['symbol']}] After canceling an order ({order_id}), the status check will be delayed. It will be checked again during the next regular cycle.",
-        )
-        with bot.state_lock:
-            if order_id in bot.pending_orders:
-                bot.pending_orders[order_id].pop("cancellation_attempted", None)
-
+        if not self.kill_switch_activated:
+            self.log("System", "The trading bot has been safely stopped.")
+            self.status_signal.emit("Stopped")
 
 class PortfolioUpdateWorker(QRunnable):
     """Run portfolio maintenance in the background to keep the UI thread responsive."""
