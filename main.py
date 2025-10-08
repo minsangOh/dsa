@@ -239,8 +239,13 @@ def clear_previous_files():
 
 
 if __name__ == "__main__":
+    # Windows 환경에서 PyQt와 multiprocessing의 충돌을 방지하기 위해 spawn을 명시적으로 설정
     try:
-        if platform.system() != "Windows":
+        if platform.system() == "Windows":
+            # Windows에서는 spawn 방식이 안전합니다.
+            multiprocessing.set_start_method('spawn', force=True)
+        else:
+            # Unix 계열 OS에서는 fork 방식 사용
             multiprocessing.set_start_method('fork', force=True)
 
         print(f"Multiprocessing start method set to: {multiprocessing.get_start_method()}")
