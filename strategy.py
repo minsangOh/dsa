@@ -144,8 +144,9 @@ def _calculate_indicators_for_process(df, df_5m):
     return latest_indicators
 
 
-def run_indicator_process_task(api_key, secret_key, symbol, tick_size, result_queue):
+def run_indicator_process_task(args):
     """Function to be run in a separate process for indicator calculation."""
+    api_key, secret_key, symbol, tick_size = args
     import pandas as pd
     import pandas_ta as ta
 
@@ -180,10 +181,10 @@ def run_indicator_process_task(api_key, secret_key, symbol, tick_size, result_qu
                     float(latest_prev["close"]) - float(prev_two["open"])
                 ) / float(tick_size)
 
-        result_queue.put((symbol, indicators))
+        return (symbol, indicators)
     except Exception as e:
         print(f"[IndicatorProcess:{symbol}] Error: {e}")
-        result_queue.put((symbol, {"__failed__": True}))
+        return (symbol, {"__failed__": True})
 
 
 # --- Qt-based Workers and Signals (for non-blocking tasks) ---
@@ -519,78 +520,39 @@ class StrategyManager(QObject):
         super().__init__()
         self.bot = bot_instance
         self.is_running = True
+        self.is_busy = False
 
         self.indicator_cache = {}
         self.c5_sell_liquidity_history = {}
-        self.processing_queue = deque()
-        self.master_cycle_start_time = 0
-        self.is_busy = False  # Flag to indicate a task is running
+        self.active_workers = 0
 
         self.buy_thread_pool = QThreadPool()
-        self.buy_thread_pool.setMaxThreadCount(1)
+        # Allow concurrent buy checks, as they are I/O bound
+        self.buy_thread_pool.setMaxThreadCount(multiprocessing.cpu_count())
+
         self.scan_thread_pool = QThreadPool()
         self.scan_thread_pool.setMaxThreadCount(1)
 
-        # --- Multiprocessing Setup ---
-        self.mp_manager = multiprocessing.Manager()
-        self.indicator_results_queue = self.mp_manager.Queue()
-        self.indicator_process = None
+        # Use half of the available CPU cores, with a minimum of 1
+        cpu_cores = max(1, multiprocessing.cpu_count() // 2)
+        self.indicator_pool = multiprocessing.Pool(processes=cpu_cores)
 
-        # Main processing loop timer
-        self.main_loop_timer = QTimer()
-        self.main_loop_timer.timeout.connect(self._main_loop)
-        self.main_loop_timer.start(200)  # Tick every 200ms
-
-        # Timer to trigger a new universe scan
         self.scan_timer = QTimer()
         self.scan_timer.timeout.connect(self.start_universe_scan)
 
     def stop(self):
         self.is_running = False
-        self.main_loop_timer.stop()
         self.scan_timer.stop()
         self.buy_thread_pool.clear()
         self.buy_thread_pool.waitForDone()
         self.scan_thread_pool.clear()
         self.scan_thread_pool.waitForDone()
-        if self.indicator_process and self.indicator_process.is_alive():
-            self.indicator_process.terminate()
-            self.indicator_process.join()
-        try:
-            self.mp_manager.shutdown()
-        except Exception:
-            pass # Already shutdown
+        self.indicator_pool.close()
+        self.indicator_pool.join()
 
     def start_scan_timer(self):
         self.scan_timer.start(config.MASTER_SCAN_INTERVAL_SECONDS * 1000)
-        self.start_universe_scan() # Trigger first scan immediately
-
-    @pyqtSlot()
-    def _main_loop(self):
-        if not self.is_running or self.is_busy:
-            return
-
-        # 1. Check for indicator results
-        if not self.indicator_results_queue.empty():
-            try:
-                symbol, indicators = self.indicator_results_queue.get_nowait()
-                self.handle_indicator_result(symbol, indicators)
-                # Don't return, let buy check start if needed, but loop will be busy
-            except Exception:
-                pass # Queue was empty, race condition
-
-        # 2. If not busy with a buy check, process next symbol
-        if self.is_busy:
-            return
-
-        if self.processing_queue:
-            symbol_to_process = self.processing_queue.popleft()
-            self.start_indicator_process(symbol_to_process)
-        else:
-            # Queue is empty, do nothing and wait for next universe scan
-            self.status_update_signal.emit(
-                f"<Cycle {self.bot.cycle_count}> Waiting for next scan..."
-            )
+        self.start_universe_scan()
 
     @pyqtSlot()
     def start_universe_scan(self):
@@ -620,46 +582,41 @@ class StrategyManager(QObject):
         targets, reason = self._build_targets_for_cycle()
         if not targets:
             self.bot.log("System", f"No targets to process. Reason: {reason}")
-        else:
-            self.bot.log("System", f"Queueing {len(targets)} symbols for analysis.")
-            self.processing_queue = deque(targets)
+            self.is_busy = False
+            return
 
-        self.is_busy = False
+        self.bot.log("System", f"Queueing {len(targets)} symbols for parallel analysis.")
+        self.active_workers = len(targets)
 
-    def start_indicator_process(self, symbol):
-        self.is_busy = True
-        display_symbol = format_symbol_display(symbol)
-        total = len(self.bot.tradable_universe)
-        processed = total - len(self.processing_queue)
-        progress_pct = (processed / total) * 100 if total > 0 else 0
+        tasks = []
+        for symbol in targets:
+            tasks.append((
+                self.bot.api.api_key,
+                self.bot.api.secret_key,
+                symbol,
+                self.bot.tick_sizes.get(symbol)
+            ))
 
-        status_msg = f"<Cycle {self.bot.cycle_count}> [{display_symbol}] Evaluating {processed}/{total} ({progress_pct:.0f}%)"
-        self.status_update_signal.emit(status_msg)
-        self.bot.log("System", status_msg)
+        self.indicator_pool.map_async(run_indicator_process_task, tasks, callback=self.handle_all_indicators_completed)
 
-        args = (
-            self.bot.api.api_key,
-            self.bot.api.secret_key,
-            symbol,
-            self.bot.tick_sizes.get(symbol),
-            self.indicator_results_queue,
-        )
-        self.indicator_process = multiprocessing.Process(
-            target=run_indicator_process_task, args=args
-        )
-        self.indicator_process.start()
+    def handle_all_indicators_completed(self, results):
+        """Callback function for when all indicator processes in the pool are done."""
+        total_symbols = len(results)
+        self.bot.log("System", f"Completed parallel analysis for {total_symbols} symbols.")
 
-    def handle_indicator_result(self, symbol, indicators):
-        if indicators and not indicators.get("__failed__", False):
-            with self.bot.state_lock:
-                self.indicator_cache[symbol] = {
-                    "data": indicators,
-                    "timestamp": time.time(),
-                }
-            self.start_buy_evaluation(symbol, indicators)
-        else:
-            self.bot.log("System", f"Indicator calculation failed for {symbol}.")
-            self.is_busy = False # Free up the loop if calc fails
+        for symbol, indicators in results:
+            if indicators and not indicators.get("__failed__", False):
+                with self.bot.state_lock:
+                    self.indicator_cache[symbol] = {
+                        "data": indicators,
+                        "timestamp": time.time(),
+                    }
+                # Start buy evaluation for each successful result
+                self.start_buy_evaluation(symbol, indicators)
+            else:
+                self.bot.log("System", f"Indicator calculation failed for {symbol}.")
+                # Since buy evaluation won't start, we need to decrement the worker count here
+                self.on_buy_worker_completed(symbol)
 
     def _build_targets_for_cycle(self):
         with self.bot.state_lock:
@@ -689,12 +646,10 @@ class StrategyManager(QObject):
         return final_targets, None
 
     def start_buy_evaluation(self, symbol, indicators):
-        self.bot.log("System", f"[{format_symbol_display(symbol)}] Starting buy evaluation.")
+        # self.bot.log("System", f"[{format_symbol_display(symbol)}] Starting buy evaluation.")
         with self.bot.state_lock:
             if len(self.bot.portfolio) >= MAX_POSITIONS:
-                self.bot.log("System", "Max positions reached, stopping cycle.")
-                self.processing_queue.clear()
-                self.is_busy = False
+                # self.bot.log("System", "Max positions reached, stopping cycle.")
                 return
 
         coin_data = {"symbol": symbol}
@@ -711,8 +666,21 @@ class StrategyManager(QObject):
 
     @pyqtSlot(str)
     def on_buy_worker_completed(self, symbol):
-        self.bot.log("System", f"[{format_symbol_display(symbol)}] Buy evaluation completed.")
-        self.is_busy = False
+        self.active_workers -= 1
+
+        total = len(self.bot.tradable_universe)
+        processed = total - self.active_workers
+        progress_pct = (processed / total) * 100 if total > 0 else 0
+
+        self.status_update_signal.emit(
+            f"<Cycle {self.bot.cycle_count}> Evaluating {processed}/{total} ({progress_pct:.0f}%)"
+        )
+
+        if self.active_workers <= 0:
+            self.status_update_signal.emit(
+                f"<Cycle {self.bot.cycle_count}> Evaluation complete for {total} symbols."
+            )
+            self.is_busy = False
 
     @pyqtSlot()
     def cleanup_indicator_cache(self):

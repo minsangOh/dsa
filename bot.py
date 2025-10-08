@@ -140,43 +140,65 @@ class CancelOrderWorker(QRunnable):
 
     @pyqtSlot()
     def run(self):
-        """Configure recurring timers and start the bot event loop."""
-        self.log("System", f"TradingBot thread ID: {threading.get_ident()}")
+        """Issue the cancel request and poll for confirmation with retries."""
+        bot = self.bot
+        order_id = self.order_id
+        data = self.data
 
-        # --- Strategy Manager Setup ---
-        self.strategy_manager = StrategyManager(self)
-        self.strategy_manager.buy_signal_found.connect(self.handle_buy_check_result)
-        self.strategy_manager.status_update_signal.connect(self.status_update_signal)
+        bot.log(
+            "System",
+            f"[{data['symbol']}] Order ({order_id}) exceeds 15 seconds, automatically canceled.",
+        )
 
-        if not all(
-                len(lst) == len(config.TRAILING_BOUNDS)
-                for lst in [
-                    config.TRAILING_TS_PCT,
-                    config.TRAILING_MIN_TICKS,
-                    config.TRAILING_LIM_CUSHION,
-                ]
-        ):
-            self.log(
-                "Errors", "Trailing stop configuration lists have inconsistent lengths."
+        cancel_res = self.api.cancel_order(order_id, data["symbol"], data.get("side"))
+        if not cancel_res:
+            bot.log(
+                "Trade Fail",
+                f"[{data['symbol']}] Failed to call order({order_id}) cancellation API.",
             )
-            self.stop()
+            with bot.state_lock:
+                if order_id in bot.pending_orders:
+                    bot.pending_orders[order_id].pop("cancellation_attempted", None)
             return
 
-        self.log("System", "Start the trading bot.")
-        self.load_initial_data()
+        for _ in range(5):
+            time.sleep(0.5)
+            details = self.api.get_order_details(order_id, data["symbol"])
 
-        if not self.is_running:
-            return
+            if not details:
+                continue
 
-        self.sell_timer = QTimer()
-        self.sell_timer.timeout.connect(self.perform_sell_cycle)
-        self.sell_timer.start(SELL_CYCLE_INTERVAL_SECONDS * 1000)
-        self.strategy_manager.start_scan_timer()
-        self.exec()
+            if details.get("status") == "canceled":
+                bot.log(
+                    "System",
+                    f"[{data['symbol']}] Order ({order_id}) cancellation confirmed.",
+                )
+                with bot.state_lock:
+                    if order_id in bot.pending_orders:
+                        if bot.pending_orders[order_id]["side"] == "buy":
+                            cost = bot.pending_orders[order_id].get(
+                                "cost", Decimal("0")
+                            )
+                            bot.krw_reserved -= cost
+                        del bot.pending_orders[order_id]
+                        bot.db.update_order_status(order_id, "canceled")
+                return
 
-        if not self.kill_switch_activated:
-            self.log("System", "The trading bot has been safely stopped.")
-            self.status_signal.emit("Stopped")
+            if details.get("status") == "closed":
+                bot.log(
+                    "System",
+                    f"[{data['symbol']}] Confirmation of order cancellation attempt ({order_id}).",
+                )
+                return
+
+        bot.log(
+            "System",
+            f"[{data['symbol']}] After canceling an order ({order_id}), the status check will be delayed. It will be checked again during the next regular cycle.",
+        )
+        with bot.state_lock:
+            if order_id in bot.pending_orders:
+                bot.pending_orders[order_id].pop("cancellation_attempted", None)
+
 
 class PortfolioUpdateWorker(QRunnable):
     """Run portfolio maintenance in the background to keep the UI thread responsive."""
@@ -196,6 +218,25 @@ class PortfolioUpdateWorker(QRunnable):
             self.bot.log("Errors", f"PortfolioUpdateWorker Error: {e}")
         finally:
             self.bot.mark_portfolio_update_finished()
+
+
+class SellCycleWorker(QRunnable):
+    """Runs the sell logic in a background thread to avoid blocking."""
+
+    def __init__(self, bot_instance: "TradingBot") -> None:
+        super().__init__()
+        self.bot = bot_instance
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            if self.bot.is_running:
+                with self.bot.state_lock:
+                    portfolio_copy = list(self.bot.portfolio.items())
+                if portfolio_copy:
+                    self.bot.process_sell_logic(portfolio_copy)
+        except Exception as e:
+            self.bot.log("Errors", f"SellCycleWorker Error: {e}")
 
 
 class TradingBot(QThread):
@@ -237,7 +278,9 @@ class TradingBot(QThread):
             self.fixed_buy_amount = Decimal("0")
 
         self.worker_thread_pool = QThreadPool()
-        self.worker_thread_pool.setMaxThreadCount(2)  # For portfolio and cancels
+        self.worker_thread_pool.setMaxThreadCount(
+            multiprocessing.cpu_count() + 2
+        )  # More threads for concurrent workers
         self._portfolio_update_lock = threading.Lock()
         self._portfolio_update_active = False
 
@@ -298,17 +341,22 @@ class TradingBot(QThread):
 
         # --- Timers Setup ---
         self.sell_timer = QTimer()
-        self.sell_timer.timeout.connect(self.perform_sell_cycle)
+        self.sell_timer.timeout.connect(self.schedule_sell_cycle)
         self.sell_timer.start(SELL_CYCLE_INTERVAL_SECONDS * 1000)
 
         # Start the strategy manager's own internal timers
-        self.strategy_manager.start_timers()
+        self.strategy_manager.start_scan_timer()
 
         self.exec()
 
         if not self.kill_switch_activated:
             self.log("System", "The trading bot has been safely stopped.")
             self.status_signal.emit("Stopped")
+
+    def schedule_sell_cycle(self):
+        """Schedules a sell cycle worker to run in the background thread pool."""
+        worker = SellCycleWorker(self)
+        self.worker_thread_pool.start(worker)
 
     def load_initial_data(self):
         """Fetch balances and market metadata required before the first cycle."""
@@ -586,19 +634,6 @@ class TradingBot(QThread):
             return
         except Exception as e:
             self.log("Errors", f"handle_buy_check_result Error: {e}")
-
-    @pyqtSlot()
-    def perform_sell_cycle(self):
-        """Iterate positions and evaluate whether any sell rules are met."""
-        try:
-            if not self.is_running:
-                return
-            with self.state_lock:
-                portfolio_copy = list(self.portfolio.items())
-            if portfolio_copy:
-                self.process_sell_logic(portfolio_copy)
-        except Exception as e:
-            self.log("Errors", f"perform_sell_cycle Error: {e}")
 
     def process_sell_logic(self, portfolio_copy):
         """Compare prices against exit criteria and decide which symbols to sell."""

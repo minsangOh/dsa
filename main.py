@@ -185,7 +185,7 @@ class MainWindow(QMainWindow):
 
         self.worker.start()
         self.request_portfolio_update()
-        self.portfolio_timer.start(10000)
+        self.portfolio_timer.start(30000)
 
     def stop_trading(self):
         """Stop the running bot if present and restore the UI to idle state."""

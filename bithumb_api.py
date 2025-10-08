@@ -20,7 +20,7 @@ def create_bithumb_client(api_key, secret_key):
             'enableRateLimit': True,
             'timeout': 10000,
         })
-        client.load_markets(True)
+        client.load_markets()
         return client
     except ccxt.BaseError as e:
         print(f"Failed to initialize CCXT API key: {e}")
